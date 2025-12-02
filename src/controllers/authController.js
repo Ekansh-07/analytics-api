@@ -1,54 +1,108 @@
-const pool = require('../config/db');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
+const User = require('../models/User');
+const App = require('../models/App');
+const ApiKey = require('../models/ApiKey');
 const generateApiKey = require('../utils/apiKeyGenerator');
+
+async function login(req, res) {
+  try {
+    const { email, name } = req.body;
+    if (!email) return res.status(400).json({ message: 'email is required' });
+
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = await User.create({ email, name });
+    }
+
+    const token = jwt.sign(
+      { userId: user._id.toString(), email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user._id.toString(),
+        email: user.email,
+        name: user.name
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+}
+
 
 async function registerApp(req, res) {
   try {
     const { name, description, expiresInDays } = req.body;
-    if (!name) return res.status(400).json({ message: "App name is required" });
+    if (!name) return res.status(400).json({ message: 'App name is required' });
 
     const userId = req.user.id;
 
-    const appResult = await pool.query(
-      'INSERT INTO apps (user_id, name, description) VALUES ($1,$2,$3) RETURNING *',
-      [userId, name, description || null]
-    );
-    const app = appResult.rows[0];
+    const app = await App.create({
+      user: userId,
+      name,
+      description: description || ''
+    });
 
     const key = generateApiKey();
-    const expiresAt = expiresInDays
-      ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000)
-      : null;
+    let expiresAt = null;
+    if (expiresInDays) {
+      expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000);
+    }
 
-    const apiKeyResult = await pool.query(
-      'INSERT INTO api_keys (app_id, key, expires_at) VALUES ($1,$2,$3) RETURNING *',
-      [app.id, key, expiresAt]
-    );
+    const apiKeyDoc = await ApiKey.create({
+      app: app._id,
+      key,
+      expiresAt
+    });
 
     res.status(201).json({
-      app,
-      apiKey: apiKeyResult.rows[0].key,
+      app: {
+        id: app._id.toString(),
+        name: app.name,
+        description: app.description
+      },
+      apiKey: apiKeyDoc.key,
       expiresAt
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Internal server error" });
+    res.status(500).json({ message: 'Internal server error' });
   }
 }
 
 async function getApiKeys(req, res) {
   try {
     const userId = req.user.id;
-    const result = await pool.query(
-      `SELECT api_keys.id, api_keys.key, api_keys.revoked, api_keys.expires_at, apps.id AS app_id, apps.name AS app_name
-       FROM api_keys
-       JOIN apps ON apps.id = api_keys.app_id
-       WHERE apps.user_id=$1`,
-      [userId]
-    );
-    res.json({ apiKeys: result.rows });
+
+    const keys = await ApiKey.find()
+      .populate({
+        path: 'app',
+        match: { user: userId },
+        select: 'name'
+      })
+      .lean();
+
+    const filtered = keys.filter(k => k.app); // only apps owned by user
+
+    res.json({
+      apiKeys: filtered.map(k => ({
+        id: k._id.toString(),
+        key: k.key,
+        revoked: k.revoked,
+        expiresAt: k.expiresAt,
+        app_id: k.app._id.toString(),
+        app_name: k.app.name
+      }))
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Internal server error" });
+    res.status(500).json({ message: 'Internal server error' });
   }
 }
 
@@ -56,25 +110,21 @@ async function revokeApiKey(req, res) {
   try {
     const userId = req.user.id;
     const { apiKeyId } = req.body;
-    if (!apiKeyId) return res.status(400).json({ message: "apiKeyId is required" });
+    if (!apiKeyId) return res.status(400).json({ message: 'apiKeyId is required' });
 
-    const check = await pool.query(
-      `SELECT api_keys.id
-       FROM api_keys
-       JOIN apps ON apps.id = api_keys.app_id
-       WHERE api_keys.id=$1 AND apps.user_id=$2`,
-      [apiKeyId, userId]
-    );
-    if (check.rows.length === 0) {
-      return res.status(404).json({ message: "API key not found or not owned by user" });
+    const apiKeyDoc = await ApiKey.findById(apiKeyId).populate('app');
+    if (!apiKeyDoc || apiKeyDoc.app.user.toString() !== userId) {
+      return res.status(404).json({ message: 'API key not found or not owned by user' });
     }
 
-    await pool.query('UPDATE api_keys SET revoked=true WHERE id=$1', [apiKeyId]);
-    res.json({ message: "API key revoked" });
+    apiKeyDoc.revoked = true;
+    await apiKeyDoc.save();
+
+    res.json({ message: 'API key revoked' });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Internal server error" });
+    res.status(500).json({ message: 'Internal server error' });
   }
 }
 
-module.exports = { registerApp, getApiKeys, revokeApiKey };
+module.exports = { login, registerApp, getApiKeys, revokeApiKey };
